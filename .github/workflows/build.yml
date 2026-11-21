@@ -1,0 +1,151 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+name: Build MicroPython Custom Firmware
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        chip: [esp8266, esp32]
+        include:
+          - chip: esp8266
+            flash_size: 4M
+          - chip: esp32
+            flash_size: 4M
+
+    steps:
+      - name: Checkout custom repo
+        uses: actions/checkout@v4
+
+      - name: Checkout MicroPython
+        uses: actions/checkout@v4
+        with:
+          repository: micropython/micropython
+          path: micropython
+          submodules: recursive
+
+      - name: Copy custom files to MicroPython tree
+        run: |
+          mkdir -p micropython/ports/${{ matrix.chip }}/custom_modules
+          # Copy custom modules directory
+          if [ -d custom_modules ]; then
+            cp -r custom_modules/* micropython/ports/${{ matrix.chip }}/custom_modules/
+          fi
+          # Copy custom manifest file
+          if [ -f custom_manifest.py ]; then
+            cp custom_manifest.py micropython/ports/${{ matrix.chip }}/
+          fi
+          # Verify the files were copied
+          echo "=== Contents of micropython/ports/${{ matrix.chip }}/ ==="
+          ls -la micropython/ports/${{ matrix.chip }}/
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git wget flex bison gperf python3 python3-pip python3-venv cmake ninja-build libffi-dev pkg-config
+          pip3 install pyserial esptool pyelftools ar
+
+      # ------------------------------------------------------------------
+      # ESP8266: download the pre-built xtensa-lx106-elf standalone toolchain
+      # ------------------------------------------------------------------
+      - name: Setup ESP8266 Toolchain
+        if: matrix.chip == 'esp8266'
+        run: |
+          wget https://micropython.org/resources/xtensa-lx106-elf-standalone.tar.gz
+          tar zxf xtensa-lx106-elf-standalone.tar.gz
+          rm xtensa-lx106-elf/bin/esptool.py
+          echo "$(pwd)/xtensa-lx106-elf/bin" >> $GITHUB_PATH
+
+      # ------------------------------------------------------------------
+      # ESP32: clone ESP-IDF and run its install script.
+      # MicroPython master branch currently recommends ESP-IDF v5.5.6.
+      # ------------------------------------------------------------------
+      - name: Setup ESP-IDF (ESP32)
+        if: matrix.chip == 'esp32'
+        run: |
+          git clone --depth 1 --branch v5.5.6 --recursive https://github.com/espressif/esp-idf.git esp-idf
+          cd esp-idf
+          export IDF_PATH=$(pwd)
+          ./install.sh esp32
+
+      - name: Build mpy-cross
+        run: |
+          make -C micropython/mpy-cross
+
+      # ------------------------------------------------------------------
+      # ESP8266 firmware build.
+      # ESP8266 uses a Makefile-based build that resolves FROZEN_MANIFEST
+      # relative to the port directory, so a relative path works here.
+      # However, we use an absolute path for consistency.
+      # ------------------------------------------------------------------
+      - name: Build ESP8266 Firmware
+        if: matrix.chip == 'esp8266'
+        run: |
+          cd micropython/ports/esp8266
+          make submodules
+          MANIFEST_PATH="$(pwd)/custom_manifest.py"
+          make BOARD=ESP8266_GENERIC FLASH_SIZE=${{ matrix.flash_size }} FROZEN_MANIFEST="$MANIFEST_PATH"
+
+      # ------------------------------------------------------------------
+      # ESP32 firmware build.
+      #
+      # CRITICAL FIX: The ESP32 port uses CMake/Ninja (via ESP-IDF).
+      # The makemanifest.py script is executed with CWD set to
+      # build-ESP32_GENERIC/esp-idf/main/, so a relative FROZEN_MANIFEST
+      # path would be resolved there instead of the port directory.
+      # We MUST pass an absolute path.
+      # ------------------------------------------------------------------
+      - name: Build ESP32 Firmware
+        if: matrix.chip == 'esp32'
+        env:
+          IDF_PATH: ${{ github.workspace }}/esp-idf
+        run: |
+          cd micropython/ports/esp32
+
+          # Source ESP-IDF environment before any make commands
+          set +e
+          source $IDF_PATH/export.sh
+          source_exit_code=$?
+          set -e
+
+          if [ $source_exit_code -ne 0 ]; then
+            echo "::error::Failed to source ESP-IDF export.sh. Check install.sh logs above."
+            exit 1
+          fi
+
+          echo "Successfully sourced ESP-IDF. IDF_PATH=$IDF_PATH"
+
+          make submodules
+
+          # CRITICAL: Use absolute path for FROZEN_MANIFEST.
+          # The ESP32 build runs makemanifest.py from the build directory,
+          # so a relative path would fail to find the manifest file.
+          MANIFEST_PATH="$(pwd)/custom_manifest.py"
+          echo "Using FROZEN_MANIFEST=$MANIFEST_PATH"
+
+          if [ "${{ matrix.flash_size }}" = "4M" ]; then
+            make BOARD=ESP32_GENERIC FROZEN_MANIFEST="$MANIFEST_PATH"
+          else
+            make BOARD=ESP32_GENERIC BOARD_VARIANT=FLASH_${{ matrix.flash_size }} FROZEN_MANIFEST="$MANIFEST_PATH"
+          fi
+
+      # ------------------------------------------------------------------
+      # Upload build artifacts.
+      # ------------------------------------------------------------------
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware_${{ matrix.chip }}
+          path: |
+            micropython/ports/esp8266/build-ESP8266_GENERIC*/firmware.bin
+            micropython/ports/esp32/build-ESP32_GENERIC*/firmware.bin
